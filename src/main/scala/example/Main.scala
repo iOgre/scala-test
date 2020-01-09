@@ -1,30 +1,50 @@
 package example
 
-import java.time.LocalDateTime
-import java.util.concurrent.Executors
+import cats.implicits._
+import zio.duration._
+import zio.interop.catz._
+import zio.{ZEnv, ZIO, blocking, clock}
 
-import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Promise}
 
-object Main extends App {
-  private val blockingEc =
-    ExecutionContext.fromExecutor(Executors.newCachedThreadPool())
-  def run(ids: List[Int]): BlackResult = {
-    // Если сервис RED недоступен, то надо подставить значение по умолчанию: RedAdapter.defaultResult(id)
-    val red = ids.map(RedAdapter.run)
+case object GreenServiceTimeout extends RuntimeException
+case object BlueServiceTimeout extends RuntimeException
 
-    val green = Await.result(GreenAdapter.run(red)(blockingEc), 10.seconds)
+object Main extends zio.App {
 
-    val promise = Promise[BlueResult]()
-    BlueAdapter.run(green, promise.success)
-    val blue = Await.result(promise.future, 10.seconds)
+  def main(ids: List[Int])(implicit runtime: zio.Runtime[ZEnv]): ZIO[ZEnv, Throwable, BlackResult] =
+    for {
+      // Если сервис RED недоступен, то надо подставить значение по умолчанию: RedAdapter.defaultResult(id)
+      red <- ids.traverse { id =>
+        blocking
+          .effectBlocking(RedAdapter.run(id))
+          .handleError(_ => RedAdapter.defaultResult(id))
+      }
+      green <- blocking
+        .blocking(ZIO.fromFuture(ec => GreenAdapter.run(red)(ec)))
+        .timeout(10.seconds)
+        .someOrFail(GreenServiceTimeout)
+      blue <- ZIO
+        .effectAsync[Any, Throwable, BlueResult] { callback =>
+          BlueAdapter.run(green,
+                          blueResult => callback(ZIO.succeed(blueResult)))
+        }
+        .timeout(10.seconds)
+        .someOrFail(BlueServiceTimeout)
+      black <- ZIO.bracket(ZIO.effect(BlackAdapter.init())) { r =>
+        ZIO.effect(r.destroy()).either
+      } { r =>
+        blocking.effectBlocking(r.run(blue))
+      }
+    } yield black
 
-    val blackResource = BlackAdapter.init()
-    val black = blackResource.run(blue)
-    blackResource.destroy()
-    black
-  }
-  println(LocalDateTime.now())
-  println(run(1.to(10).toList))
-  println(LocalDateTime.now())
+  override def run(args: List[String]): ZIO[ZEnv, Nothing, Int] =
+    for {
+      before <- clock.currentDateTime
+      _ <- console.putStrLn(before.toString)
+      runtime <- ZIO.runtime[zio.ZEnv]
+      eitherResult <- main(1.to(10).toList)(runtime).either
+      _ <- console.putStrLn(eitherResult.toString)
+      after <- clock.currentDateTime
+      _ <- console.putStrLn(after.toString)
+    } yield 0
 }
